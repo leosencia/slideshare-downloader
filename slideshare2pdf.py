@@ -1,171 +1,143 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import sys, os
-import img2pdf
+import json
 import re
-import requests
-
+import sys
+import tempfile
+from pathlib import Path
 from time import localtime, strftime
-from os import listdir, walk
-from os.path import isfile, join
+from urllib.parse import urldefrag, urlsplit
 
-try:
-    from urllib.request import urlopen  # python3
-except ImportError:
-    from urllib2 import urlopen  # python2
-try:
-    from bs4 import BeautifulSoup  # python3
-except ImportError:
-    from BeautifulSoup import BeautifulSoup  # python2
-try:
-    input = raw_input  # python2
-except NameError:
-    pass  # python3
+import img2pdf
+import requests
+from bs4 import BeautifulSoup
 
-# from selenium import webdriver
-# from selenium.webdriver.common.by import By
-# from selenium.webdriver.support.ui import WebDriverWait
-# from selenium.webdriver.support import expected_conditions as EC
-# from selenium.webdriver.chrome.options import Options
-# from selenium.webdriver.chrome.service import Service
 
-# import time
+CURRENT = Path(__file__).resolve().parent
+REQUEST_TIMEOUT = (10, 60)
 
-CURRENT = os.path.dirname(__file__)
 
-# options = Options()
+def extract_slide_urls(soup):
+    """Read this presentation's slide metadata, excluding recommendations."""
+    script = soup.find("script", id="__NEXT_DATA__")
+    if script:
+        try:
+            data = json.loads(script.string or script.get_text())
+            slideshow = data["props"]["pageProps"]["slideshow"]
+            slides = slideshow["slides"]
+            size = max(slides["imageSizes"], key=lambda item: int(item["width"]))
+            count = int(slideshow["totalSlides"])
+            if count > 0:
+                prefix = "{}/{}/{}/{}".format(
+                    slides["host"].rstrip("/"),
+                    slides["imageLocation"].strip("/"),
+                    size["quality"],
+                    slides["title"],
+                )
+                return [
+                    "{}-{}-{}.jpg".format(prefix, index, size["width"])
+                    for index in range(1, count + 1)
+                ]
+        except (KeyError, TypeError, ValueError):
+            # Older pages may only expose slide URLs in the HTML.
+            pass
 
-# options.headless = True
-# options.add_argument("start-maximized")
-# options.add_experimental_option("excludeSwitches", ["enable-automation"])
-# options.add_experimental_option('useAutomationExtension', False)
-# service = Service(executable_path=r'/opt/local/bin/chromedriver')
-# driver = webdriver.Chrome(service=service, options=options)
+    urls = []
+    for image in soup.select('img[data-testid="vertical-slide-image"]'):
+        candidates = []
+        for candidate in image.get("srcset", "").split(","):
+            parts = candidate.split()
+            if not parts:
+                continue
+            width = 0
+            if len(parts) > 1 and re.fullmatch(r"\d+w", parts[1]):
+                width = int(parts[1][:-1])
+            candidates.append((width, parts[0]))
+        image_url = (
+            max(candidates, key=lambda item: item[0])[1]
+            if candidates else image.get("src")
+        )
+        if image_url and image_url not in urls:
+            urls.append(image_url)
+
+    if not urls:
+        raise ValueError(
+            "No slide images found. SlideShare may have changed its page format, "
+            "or returned a login/access-check page. Open the URL in your browser "
+            "to confirm the presentation is available."
+        )
+    return urls
 
 
 def download_images(url):
-    ## Update 2024-07-17: revert to requests instead of selenium
-    html = requests.get(url).content
-    # driver.get(url)
-    # driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    url = urldefrag(url)[0]
+    with requests.Session() as session:
+        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
+        image_urls = extract_slide_urls(soup)
 
-    # modify this depend on your internet connection and the size of the slides
-    # time.sleep(5)
+        # Remove the slide number and image width without stripping title letters.
+        image_name = Path(urlsplit(image_urls[0]).path).name
+        name = re.sub(r"-\d+-\d+\.[^.]+$", "", image_name)
+        pdf_f = (re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_") or "result") + ".pdf"
+        image_root = CURRENT / "pdf_images"
+        image_root.mkdir(exist_ok=True)
+        image_dir = Path(tempfile.mkdtemp(
+            prefix=strftime("%Y%m%d_%H%M%S_", localtime()), dir=image_root
+        ))
 
-    # Get the page source after interactions
-    # page_source = driver.page_source.encode('utf-8')
+        print("1. Download Images ({} slides):".format(len(image_urls)))
+        for index, image_url in enumerate(image_urls, 1):
+            print("Downloading {}/{}: {}".format(index, len(image_urls), image_url))
+            image_response = session.get(image_url, timeout=REQUEST_TIMEOUT)
+            image_response.raise_for_status()
+            content_type = image_response.headers.get("Content-Type", "")
+            if not image_response.content or (
+                content_type and not content_type.lower().startswith("image/")
+            ):
+                raise ValueError(
+                    "Slide {} did not return an image: {}".format(index, image_url)
+                )
+            (image_dir / "{}.jpg".format(index)).write_bytes(image_response.content)
 
-    # soup = BeautifulSoup(page_source, 'html.parser')
-    soup = BeautifulSoup(html, "html.parser")
-    # with open('soup.html', 'wb') as f:
-    #    f.write(soup)
-
-    title = "".join(
-        (CURRENT + "/pdf_images", strftime("/%Y%m%d_%H%M%S", localtime()))
-    )  # temp img dir
-
-    # images = soup.findAll('source', {'data-testid':'slide-image-source'})
-    ## Update 2024-07-17. Sample data:
-    # <img alt="Hands on Apache Flink
-    # How to run, debug and speed up
-    # Flink applications
-    # Robert Metzger
-    # rmetzger@apache.org
-    # @rmetzger_
-    # " class="vertical-slide-image VerticalSlideImage_image__VtE4p VerticalSlideImage_loaded__Q7FLb" data-testid="vertical-slide-image" id="slide-image-0" loading="eager" sizes="100vw" src="https://image.slidesharecdn.com/flinktroubleshooting-new-150528082323-lva1-app6892/85/Apache-Flink-Hands-On-1-320.jpg" srcset="https://image.slidesharecdn.com/flinktroubleshooting-new-150528082323-lva1-app6892/85/Apache-Flink-Hands-On-1-320.jpg 320w, https://image.slidesharecdn.com/flinktroubleshooting-new-150528082323-lva1-app6892/85/Apache-Flink-Hands-On-1-638.jpg 638w, https://image.slidesharecdn.com/flinktroubleshooting-new-150528082323-lva1-app6892/75/Apache-Flink-Hands-On-1-2048.jpg 2048w"/>
-    images = soup.find_all("img", {"data-testid": "vertical-slide-image"})
-
-    # driver.quit()
-
-    image_url = ""
-
-    # Get URL image pattern. because not all <img> contain slide URL
-    for image in images:
-        image_url = image.get("srcset").split("w, ")[-1].split(" ")[0]
-        if image_url.endswith(".jpg"):
-            break
-
-    i = 1
-    # image_url: https://image.slidesharecdn.com/flinktroubleshooting-new-150528082323-lva1-app6892/75/Apache-Flink-Hands-On-1-2048.jpg
-    image_url_prefix = image_url.rstrip("-2048.jpg")
-    image_url_prefix = image_url_prefix.rstrip("0123456789")  # remove last slide id
-    image_url_prefix = image_url_prefix.rstrip("-")  # remove last -
-    pdf_f = re.sub(
-        "[^0-9a-zA-Z]+", "_", image_url_prefix.split("/")[-1]
-    )  # Get pdf name from URL image
-    pdf_f += ".pdf"
-    print("1. Download Images:")
-    # Get all slide image URL
-    for image in images:
-        image_url = image_url_prefix + "-" + str(i) + "-2048.jpg"
-        print(f"Downloading {image_url}")
-        # command = "wget '%s' -P '%s' --no-check-certificate" % (image_url, title)
-        # os.system(command)
-        r = requests.get(image_url)
-
-        if not os.path.exists(title):
-            os.makedirs(title)
-
-        filename = str(i) + ".jpg"
-        i += 1
-
-        with open(title + "/" + filename, "wb") as f:
-            f.write(r.content)
-
-    # Next step
-    convert_pdf(title, pdf_f)
+    return convert_pdf(image_dir, pdf_f)
 
 
 def convert_pdf(img_dir_name, pdf_f):
-    f = []
-    for dirpath, dirnames, filenames in walk(join(CURRENT, img_dir_name)):
-        f.extend(filenames)
-        break
-    f = ["%s/%s" % (img_dir_name, x) for x in f]
-
-    def atoi(text):
-        return int(text) if text.isdigit() else text
-
-    def natural_keys(text):
-        """
-        alist.sort(key=natural_keys) sorts in human order
-        http://nedbatchelder.com/blog/200712/human_sorting.html
-        (See Toothy's implementation in the comments)
-        """
-        return [atoi(c) for c in re.split(r"(\d+)", text)]
-
-    f.sort(key=natural_keys)
+    image_dir = Path(img_dir_name)
+    if not image_dir.is_absolute():
+        image_dir = CURRENT / image_dir
+    images = [
+        path for path in image_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    ] if image_dir.is_dir() else []
+    images.sort(key=lambda path: [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", path.name)
+    ])
+    if not images:
+        raise ValueError("No downloaded slide images to convert in {}".format(image_dir))
 
     print("\n2. Convert Images to PDF")
-    print(f)
+    pdf_bytes = img2pdf.convert([str(path) for path in images])
+    Path(pdf_f).write_bytes(pdf_bytes)
+    print("\n3. Done: {}".format(pdf_f))
+    return Path(pdf_f)
 
-    pdf_bytes = img2pdf.convert(f, dpi=300, x=None, y=None)
-    doc = open(pdf_f, "wb")
-    doc.write(pdf_bytes)
-    doc.close()
 
-    print(f"\n3. Done: {pdf_f}")
+def main():
+    url = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Slideshare URL: ")
+    url = url.strip().strip("\"'")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    try:
+        download_images(url)
+    except (requests.RequestException, ValueError, OSError, img2pdf.ImageOpenError) as error:
+        print("Error: {}".format(error), file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        url = " ".join(sys.argv[1:])
-    else:
-        url = input("Slideshare URL: ").strip()
-    if (url.startswith("'") and url.endswith("'")) or (
-        url.startswith('"') and url.endswith('"')
-    ):
-        url = url[1:-1]
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    pdf_f = re.sub(
-        "[^0-9a-zA-Z]+", "_", url.split("/")[-1]
-    )  # get url basename and replace non-alpha with '_'
-    if pdf_f.strip() == "":
-        print("Something wrong to get filename from URL, fallback to result.pdf")
-        pdf_f = "result.pdf"
-    else:
-        pdf_f += ".pdf"
-    # pdf_f: now use image URL as pdf name
-
-    download_images(url)
+    sys.exit(main())
