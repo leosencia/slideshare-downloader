@@ -12,6 +12,8 @@ import img2pdf
 import requests
 from bs4 import BeautifulSoup
 
+import scribd
+
 
 CURRENT = Path(__file__).resolve().parent
 REQUEST_TIMEOUT = (10, 60)
@@ -71,21 +73,39 @@ def extract_slide_urls(soup):
 
 def download_images(url):
     url = urldefrag(url)[0]
+    host = (urlsplit(url).hostname or "").lower()
+    is_scribd = host == "scribd.com" or host.endswith(".scribd.com")
+    if host == "studocu.com" or host.endswith(".studocu.com"):
+        raise ValueError(
+            "This is a Studocu link, not Scribd. Studocu support is not available; "
+            "open the document in your browser and use its Download option."
+        )
     with requests.Session() as session:
         response = session.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, "html.parser")
-        image_urls = extract_slide_urls(soup)
+        if is_scribd:
+            # Check completeness before creating folders or launching a browser.
+            scribd.extract_pages(soup)
+            title = soup.find("meta", property="og:title")
+            name = title.get("content") if title else None
+            name = (name or (soup.title.get_text() if soup.title else "Scribd_document")).split(" | ")[0]
+        else:
+            image_urls = extract_slide_urls(soup)
 
-        # Remove the slide number and image width without stripping title letters.
-        image_name = Path(urlsplit(image_urls[0]).path).name
-        name = re.sub(r"-\d+-\d+\.[^.]+$", "", image_name)
+            # Remove the slide number and width without stripping title letters.
+            image_name = Path(urlsplit(image_urls[0]).path).name
+            name = re.sub(r"-\d+-\d+\.[^.]+$", "", image_name)
         pdf_f = (re.sub(r"[^0-9a-zA-Z]+", "_", name).strip("_") or "result") + ".pdf"
         image_root = CURRENT / "pdf_images"
         image_root.mkdir(exist_ok=True)
         image_dir = Path(tempfile.mkdtemp(
             prefix=strftime("%Y%m%d_%H%M%S_", localtime()), dir=image_root
         ))
+
+        if is_scribd:
+            scribd.render_pages(soup, session, image_dir, REQUEST_TIMEOUT)
+            return convert_pdf(image_dir, pdf_f)
 
         print("1. Download Images ({} slides):".format(len(image_urls)))
         for index, image_url in enumerate(image_urls, 1):
@@ -127,7 +147,7 @@ def convert_pdf(img_dir_name, pdf_f):
 
 
 def main():
-    url = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("Slideshare URL: ")
+    url = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else input("SlideShare or Scribd URL: ")
     url = url.strip().strip("\"'")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
